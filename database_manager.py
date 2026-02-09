@@ -16,6 +16,15 @@ from config import DATABASE_CONFIG, HUMANDB_TBI_DIR, NA_STRING
 logger = logging.getLogger(__name__)
 
 
+_COMP = str.maketrans('ACGTacgt', 'TGCAtgca')
+
+def _revcom_snp(seq: str) -> str:
+    """Reverse complement for SNP alleles. Returns '-' unchanged."""
+    if seq == '-' or not seq:
+        return seq
+    return seq.translate(_COMP)[::-1]
+
+
 def _decode_annovar_escapes(val: str) -> str:
     """Decode ANNOVAR-style escape sequences like \\x2c -> comma."""
     if '\\x' in val:
@@ -199,6 +208,7 @@ class TabixDatabase:
         Format: bin, chr, start(0-based), end, name(rsID), score, strand, refNCBI, refUCSC, observed, class, ...
         ANNOVAR matches using class-specific allele encoding and exact (chr, start+1, obs) matching.
         Only processes records with class: single, deletion, in-del, insertion.
+        When strand=='-', alleles (but NOT ucscallele) are reverse-complemented before matching.
         """
         na = {col: NA_STRING for col in self.columns}
         records = self._fetch(chrom, start, end)
@@ -219,6 +229,7 @@ class TabixDatabase:
                 continue
 
             rsid = fields[4]
+            strand = fields[6]
             ucscallele = fields[8]  # refUCSC
             twoallele = fields[9]   # observed alleles
             snp_class = fields[11]  # class field
@@ -228,10 +239,17 @@ class TabixDatabase:
                 continue
 
             alleles = twoallele.split('/')
+            if len(alleles) < 2:
+                continue
+
+            # ANNOVAR: reverse complement alleles (NOT ucscallele) when strand is '-'
+            if strand == '-':
+                alleles = [_revcom_snp(a) for a in alleles]
+
             db_start_1based = db_start + 1
 
             if snp_class == 'single':
-                # Find non-reference alleles
+                # Find which allele matches ucscallele (reference), others are obs
                 for i, allele in enumerate(alleles):
                     if ucscallele == allele:
                         for j, obs_allele in enumerate(alleles):
@@ -239,8 +257,9 @@ class TabixDatabase:
                                 return {self.columns[0]: rsid}
             elif snp_class == 'insertion':
                 ins_start = db_start_1based - 1  # ANNOVAR: $start--
-                if len(alleles) > 1:
-                    db_obs = '0' + alleles[1]
+                # Check allele[1] and any additional alleles
+                for k in range(1, len(alleles)):
+                    db_obs = '0' + alleles[k]
                     if ins_start == start and db_obs == query_obs:
                         return {self.columns[0]: rsid}
             elif snp_class == 'deletion':
@@ -248,8 +267,9 @@ class TabixDatabase:
                 if db_start_1based == start and db_obs == query_obs:
                     return {self.columns[0]: rsid}
             elif snp_class == 'in-del':
-                if len(alleles) > 1:
-                    db_obs = str(len(ucscallele)) + alleles[1]
+                # Check allele[1] and any additional alleles
+                for k in range(1, len(alleles)):
+                    db_obs = str(len(ucscallele)) + alleles[k]
                     if db_start_1based == start and db_obs == query_obs:
                         return {self.columns[0]: rsid}
 
