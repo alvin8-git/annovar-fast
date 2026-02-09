@@ -113,11 +113,19 @@ class GeneAnnotator:
             self._load_mrna(mrna_file)
 
     def _load_mrna(self, fasta_path: str):
-        """Load mRNA sequences from FASTA file."""
+        """Load mRNA sequences from FASTA file.
+
+        Uses composite keys matching ANNOVAR's multimap convention:
+        For entries with 'leftmost exon at chrX:POS', the key becomes 'NAME#CHR#POS'
+        (chr prefix stripped). This handles transcripts that map to multiple locations.
+        """
         logger.info(f"Loading mRNA sequences from {fasta_path}")
         seqid = None
         curseq = []
         count = 0
+
+        import re
+        multimap_re = re.compile(r'leftmost exon at (?:chr)?([\w.]+):(\d+)')
 
         with open(fasta_path) as f:
             for line in f:
@@ -126,9 +134,13 @@ class GeneAnnotator:
                     if seqid and curseq:
                         self.mrna_seqs[seqid] = ''.join(curseq)
                         count += 1
-                    # Parse sequence ID
-                    parts = line[1:].split()
+                    # Parse sequence ID with multimap support
+                    parts = line[1:].split(None, 1)
                     seqid = parts[0]
+                    # Check for multimap annotation
+                    m = multimap_re.search(line)
+                    if m:
+                        seqid = f"{seqid}#{m.group(1)}#{m.group(2)}"
                     curseq = []
                 else:
                     curseq.append(line.upper())
@@ -296,6 +308,8 @@ class GeneAnnotator:
                     return ('exonic', '')
 
         # Variant is in intron - check for splicing
+        # Collect ALL splicing annotations (variant may overlap multiple exon splice sites)
+        splicing_details = []
         for k in range(tx.exoncount):
             exon_start = tx.exonstarts[k]
             exon_end = tx.exonends[k]
@@ -304,13 +318,18 @@ class GeneAnnotator:
             if k > 0 or tx.exoncount == 1:
                 if self._has_overlap(start, end, exon_start - self.splicing_threshold, exon_start - 1):
                     detail = self._make_splicing_annotation(tx, k, start, end, ref, alt)
-                    return ('splicing', detail)
+                    if detail:
+                        splicing_details.append(detail)
 
             # Check splicing at donor site (after exon end)
             if k < tx.exoncount - 1 or tx.exoncount == 1:
                 if self._has_overlap(start, end, exon_end + 1, exon_end + self.splicing_threshold):
                     detail = self._make_splicing_annotation(tx, k, start, end, ref, alt)
-                    return ('splicing', detail)
+                    if detail:
+                        splicing_details.append(detail)
+
+        if splicing_details:
+            return ('splicing', ';'.join(splicing_details))
 
         # If we're inside the transcript but not in any exon and not near splice sites
         if start >= tx.txstart and end <= tx.txend:
@@ -335,21 +354,28 @@ class GeneAnnotator:
         exon_start = tx.exonstarts[exon_idx]
         exon_end = tx.exonends[exon_idx]
 
-        # For indels, use r.spl notation
+        # For indels, use r.spl notation with correct exon display number
         if start != end:
+            display_exon = (tx.exoncount - exon_idx) if tx.strand == '-' else (exon_idx + 1)
             if end >= exon_start - self.splicing_threshold and end < exon_start:
-                return f"{tx.name}:exon{exon_idx+1}:r.spl"
+                return f"{tx.name}:exon{display_exon}:r.spl"
             elif start > exon_end and start <= exon_end + self.splicing_threshold:
-                return f"{tx.name}:exon{exon_idx+1}:r.spl"
+                return f"{tx.name}:exon{display_exon}:r.spl"
             return ''
 
-        if tx.strand == '+':
-            return self._splicing_plus(tx, exon_idx, start, ref, alt)
-        else:
-            return self._splicing_minus(tx, exon_idx, start, ref, alt)
+        # Non-coding transcripts: return simple r.spl without cDNA details
+        is_ncrna = (tx.cdsstart >= tx.cdsend)
 
-    def _splicing_plus(self, tx: Transcript, exon_idx: int, start: int, ref: str, alt: str) -> str:
+        if tx.strand == '+':
+            return self._splicing_plus(tx, exon_idx, start, ref, alt, is_ncrna)
+        else:
+            return self._splicing_minus(tx, exon_idx, start, ref, alt, is_ncrna)
+
+    def _splicing_plus(self, tx: Transcript, exon_idx: int, start: int, ref: str, alt: str, is_ncrna: bool = False) -> str:
         """Splicing annotation for + strand, matching ANNOVAR's exact lenexon logic."""
+        if is_ncrna:
+            return ''  # Non-coding transcripts don't get cDNA splicing annotations
+
         lenexon = 0
         for k in range(exon_idx + 1):
             es = tx.exonstarts[k]
@@ -380,52 +406,66 @@ class GeneAnnotator:
                 return f"{tx.name}:exon{exon_idx+1}:UTR5"
         return ''
 
-    def _splicing_minus(self, tx: Transcript, exon_idx: int, start: int, ref: str, alt: str) -> str:
-        """Splicing annotation for - strand, matching ANNOVAR's logic."""
-        # For - strand, ANNOVAR iterates from last exon to first
-        # The exon_idx we have is in forward order, need to map to reverse order
+    def _splicing_minus(self, tx: Transcript, exon_idx: int, start: int, ref: str, alt: str, is_ncrna: bool = False) -> str:
+        """Splicing annotation for - strand, matching ANNOVAR's logic.
+
+        ANNOVAR line 1078-1084: For - strand (iterating from last exon to first):
+        - start < exonstart[k] (before exon in genomic) → c.$lenexon+dist (donor)
+        - start > exonend[k] (after exon in genomic) → c.$lenexon-dist (acceptor), lenexon adjusted
+        """
+        if is_ncrna:
+            return ''  # Non-coding transcripts don't get cDNA splicing annotations
+
         n = tx.exoncount
-        rev_idx = n - 1 - exon_idx  # reverse index for display: exon number in reverse
 
         lenexon = 0
-        # Iterate from last exon backwards to exon_idx
+        # Iterate from last exon backwards to exon_idx (matching ANNOVAR's - strand loop)
         for k in range(n - 1, exon_idx - 1, -1):
             es = tx.exonstarts[k]
             ee = tx.exonends[k]
             lenexon += (ee - es + 1)
             if tx.cdsend >= es and tx.cdsend <= ee:
-                # CDS ends in this exon (from - strand perspective, this is where coding starts)
                 lenexon = tx.cdsend - es + 1
 
         exon_start = tx.exonstarts[exon_idx]
         exon_end = tx.exonends[exon_idx]
-        display_exon = n - exon_idx  # exon numbering in - strand
+        display_exon = n - exon_idx  # ANNOVAR: @exonstart-1-$k+1
 
-        # For - strand, donor/acceptor are flipped:
-        # ANNOVAR's - strand: donor site is at exonstart (left side), acceptor at exonend (right side)
-        if start > exon_end and start <= exon_end + self.splicing_threshold:
-            # In - strand, this is the "donor" side (upstream in mRNA)
-            dist = start - exon_end
+        if start >= exon_start - self.splicing_threshold and start < exon_start:
+            # Before exon start (genomic) = donor site on - strand → c.X+Y
+            dist = exon_start - start
             if start <= tx.cdsend:
                 return f"{tx.name}:exon{display_exon}:c.{lenexon}+{dist}{revcom(ref)}>{revcom(alt)}"
             else:
                 return f"{tx.name}:exon{display_exon}:UTR5"
-        elif start >= exon_start - self.splicing_threshold and start < exon_start:
-            # In - strand, this is the "acceptor" side
-            dist = exon_start - start
+        elif start > exon_end and start <= exon_end + self.splicing_threshold:
+            # After exon end (genomic) = acceptor site on - strand → c.X-Y
+            dist = start - exon_end
             if start <= tx.cdsend:
                 lenexon -= (exon_end - exon_start)
                 return f"{tx.name}:exon{display_exon}:c.{lenexon}-{dist}{revcom(ref)}>{revcom(alt)}"
             else:
-                return f"{tx.name}:exon{display_exon}:UTR3"
+                return f"{tx.name}:exon{display_exon}:UTR5"
         return ''
+
+    def _get_mrna_key(self, tx: Transcript) -> str:
+        """Build composite mRNA key matching ANNOVAR's multimap convention.
+        Key format: name#chr(no prefix)#txstart(0-based)
+        """
+        chrom = tx.chrom.replace('chr', '')
+        txstart_0based = tx.txstart - 1  # convert back to 0-based
+        composite = f"{tx.name}#{chrom}#{txstart_0based}"
+        if composite in self.mrna_seqs:
+            return composite
+        # Fall back to plain name for transcripts without multimap
+        return tx.name
 
     def _compute_exonic_annotation(self, tx: Transcript, start: int, end: int, ref: str, alt: str) -> Tuple[str, str]:
         """Compute exonic function and AA change annotation.
         Returns (exonic_func, aa_change_string).
         Uses ANNOVAR's exact algorithm for refvarstart/refvarend/refcdsstart.
         """
-        mrna_seq = self.mrna_seqs.get(tx.name)
+        mrna_seq = self.mrna_seqs.get(self._get_mrna_key(tx))
         if not mrna_seq:
             return ('.', '.')
 
@@ -454,6 +494,14 @@ class GeneAnnotator:
         if cds_start < 0:
             return ('.', '.')
 
+        # Reverse complement ref/obs for minus strand (ANNOVAR line 1612-1614)
+        if tx.strand == '-':
+            obs = revcom(alt) if alt != '-' else '-'
+            qref = revcom(ref) if ref != '-' else '-'
+        else:
+            obs = alt
+            qref = ref
+
         # Wildtype codon at variant start
         fs = cds_start % 3
         wt_codon_start = refvarstart - fs - 1  # 0-based in mRNA
@@ -465,71 +513,167 @@ class GeneAnnotator:
         wtaa = translate_dna(wtnt3)
         varpos = cds_start // 3 + 1
 
-        if alt == '-':
-            # Deletion
-            del_len = refvarend - refvarstart + 1
-            canno = f"c.{cds_start+1}_{cds_end+1}del"
-
-            if del_len % 3 == 0:
-                exonic_func = 'nonframeshift deletion'
-                # For the protein annotation, adjust varpos to the first fully affected codon
-                # when the deletion doesn't start on a codon boundary
-                if fs > 0:
-                    adj_varpos = (cds_start - fs + 3) // 3 + 1
+        if refvarstart == refvarend:
+            # Single position in mRNA
+            if qref == '-':
+                # Insertion
+                return self._annotate_insertion(tx, mrna_seq, exon_pos, refvarstart, refcdsstart,
+                                                cds_start, fs, wtnt3, wtaa, varpos, obs)
+            elif obs == '-':
+                # Single nucleotide deletion
+                return self._annotate_single_deletion(tx, mrna_seq, exon_pos, refvarstart, refcdsstart,
+                                                      cds_start, fs, wtnt3, wtaa, varpos)
+            elif len(obs) > 1:
+                # Block substitution (single pos to multi-base)
+                canno = f"c.{cds_start+1}delins{obs}"
+                ref_len = refvarend - refvarstart + 1
+                if (ref_len - len(obs)) % 3 == 0:
+                    exonic_func = 'nonframeshift substitution'
                 else:
-                    adj_varpos = varpos
-                varposend = cds_end // 3 + 1
-                start_aa = self._get_aa_at(mrna_seq, refcdsstart, (adj_varpos - 1) * 3)
-                end_aa = self._get_aa_at(mrna_seq, refcdsstart, (varposend - 1) * 3)
-                panno = f"p.{start_aa}{adj_varpos}_{end_aa}{varposend}del"
+                    exonic_func = 'frameshift substitution'
+                return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}")
             else:
-                exonic_func = 'frameshift deletion'
-                panno = f"p.{wtaa}{varpos}fs"
-
-            return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
-
-        elif ref == '-':
-            # Insertion
-            ins_len = len(alt)
-            if ins_len % 3 == 0:
-                exonic_func = 'nonframeshift insertion'
-            else:
-                exonic_func = 'frameshift insertion'
-
-            ins_seq = alt if tx.strand == '+' else revcom(alt)
-            canno = f"c.{cds_start}_{cds_start+1}ins{ins_seq}"
-            panno = f"p.{wtaa}{varpos}delins"  # simplified
-
-            return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
-
-        elif len(ref) == 1 and len(alt) == 1:
-            # SNV
-            codon_offset = fs
-            var_codon = list(wtnt3)
-            if tx.strand == '+':
-                var_codon[codon_offset] = alt
-            else:
-                var_codon[codon_offset] = revcom(alt)
-            var_codon = ''.join(var_codon)
-
-            var_aa = translate_dna(var_codon)
-
-            if wtaa == var_aa:
-                exonic_func = 'synonymous SNV'
-            elif var_aa == 'X':
-                exonic_func = 'stopgain'
-            elif wtaa == 'X':
-                exonic_func = 'stoploss'
-            else:
-                exonic_func = 'nonsynonymous SNV'
-
-            canno = f"c.{wtnt3[codon_offset]}{cds_start+1}{var_codon[codon_offset]}"
-            panno = f"p.{wtaa}{varpos}{var_aa}"
-
-            return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
-
+                # SNV
+                return self._annotate_snv(tx, exon_pos, cds_start, fs, wtnt3, wtaa, varpos, obs, qref)
         else:
-            return ('nonsynonymous SNV', '.')
+            # Multiple positions in mRNA
+            if obs == '-':
+                # Multi-nucleotide deletion
+                return self._annotate_deletion(tx, mrna_seq, exon_pos, refvarstart, refvarend,
+                                               refcdsstart, cds_start, cds_end, fs, wtnt3, wtaa, varpos)
+            else:
+                # Block substitution (multi-base)
+                canno = f"c.{cds_start+1}_{cds_end+1}delins{obs}"
+                ref_len = refvarend - refvarstart + 1
+                if (ref_len - len(obs)) % 3 == 0:
+                    exonic_func = 'nonframeshift substitution'
+                else:
+                    exonic_func = 'frameshift substitution'
+                return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}")
+
+    def _annotate_snv(self, tx, exon_pos, cds_start, fs, wtnt3, wtaa, varpos, obs, qref):
+        """Annotate a single nucleotide variant."""
+        codon_offset = fs
+        var_codon = list(wtnt3)
+        var_codon[codon_offset] = obs
+        var_codon = ''.join(var_codon)
+        var_aa = translate_dna(var_codon)
+
+        if wtaa == var_aa:
+            exonic_func = 'synonymous SNV'
+        elif var_aa == 'X':
+            exonic_func = 'stopgain'
+        elif wtaa == 'X':
+            exonic_func = 'stoploss'
+        else:
+            exonic_func = 'nonsynonymous SNV'
+
+        canno = f"c.{wtnt3[codon_offset]}{cds_start+1}{obs}"
+        panno = f"p.{wtaa}{varpos}{var_aa}"
+        return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
+
+    def _annotate_insertion(self, tx, mrna_seq, exon_pos, refvarstart, refcdsstart,
+                            cds_start, fs, wtnt3, wtaa, varpos, obs):
+        """Annotate an insertion variant."""
+        ins_len = len(obs)
+        if ins_len % 3 == 0:
+            exonic_func = 'nonframeshift insertion'
+        else:
+            exonic_func = 'frameshift insertion'
+
+        # cDNA annotation: check for dup, handle strand-specific position
+        if tx.strand == '+':
+            # Check for duplication
+            if obs == mrna_seq[refvarstart - 1:refvarstart - 1 + len(obs)] if refvarstart - 1 + len(obs) <= len(mrna_seq) else False:
+                canno = f"c.{cds_start+1}dup{obs}"
+            elif refvarstart < len(mrna_seq) and obs == mrna_seq[refvarstart:refvarstart + len(obs)] if refvarstart + len(obs) <= len(mrna_seq) else False:
+                canno = f"c.{cds_start+2}dup{obs}"
+            else:
+                canno = f"c.{cds_start+1}_{cds_start+2}ins{obs}"
+        else:
+            # Minus strand: "after current site" becomes "before current site"
+            if refvarstart >= 2 and obs == mrna_seq[refvarstart - 2:refvarstart - 2 + len(obs)] if refvarstart - 2 + len(obs) <= len(mrna_seq) else False:
+                canno = f"c.{cds_start}dup{obs}"
+            elif obs == mrna_seq[refvarstart - 1:refvarstart - 1 + len(obs)] if refvarstart - 1 + len(obs) <= len(mrna_seq) else False:
+                canno = f"c.{cds_start+1}dup{obs}"
+            else:
+                canno = f"c.{cds_start}_{cds_start+1}ins{obs}"
+
+        # Protein annotation
+        # Build variant codon for translation
+        if tx.strand == '+':
+            if fs == 1:
+                varnt3 = wtnt3[0] + wtnt3[1] + obs + wtnt3[2]
+            elif fs == 2:
+                varnt3 = wtnt3[0] + wtnt3[1] + wtnt3[2] + obs
+            else:
+                varnt3 = wtnt3[0] + obs + wtnt3[1] + wtnt3[2]
+        else:
+            if fs == 1:
+                varnt3 = wtnt3[0] + obs + wtnt3[1] + wtnt3[2]
+            elif fs == 2:
+                varnt3 = wtnt3[0] + wtnt3[1] + obs + wtnt3[2]
+            else:
+                varnt3 = obs + wtnt3[0] + wtnt3[1] + wtnt3[2]
+
+        varaa = translate_dna(varnt3)
+
+        if ins_len % 3 == 0:
+            # Nonframeshift insertion
+            if varaa and '*' in varaa:
+                varaa = varaa[:varaa.index('*')] + 'X'
+            panno = f"p.{wtaa}{varpos}delins{varaa}"
+        else:
+            # Frameshift insertion
+            panno = f"p.{wtaa}{varpos}fs"
+
+        return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
+
+    def _annotate_single_deletion(self, tx, mrna_seq, exon_pos, refvarstart, refcdsstart,
+                                   cds_start, fs, wtnt3, wtaa, varpos):
+        """Annotate a single nucleotide deletion."""
+        # Get the next codon for frameshift computation
+        wt_codon_start = refvarstart - fs - 1
+        wtnt3_after_start = refvarstart - fs + 2
+        wtnt3_after = mrna_seq[wtnt3_after_start:wtnt3_after_start + 3] if wtnt3_after_start + 3 <= len(mrna_seq) else ''
+
+        if fs == 1:
+            deletent = wtnt3[1]
+            varnt3 = wtnt3[0] + wtnt3[2] + (wtnt3_after[0] if wtnt3_after else '')
+        elif fs == 2:
+            deletent = wtnt3[2]
+            varnt3 = wtnt3[0] + wtnt3[1] + (wtnt3_after[0] if wtnt3_after else '')
+        else:
+            deletent = wtnt3[0]
+            varnt3 = wtnt3[1] + wtnt3[2] + (wtnt3_after[0] if wtnt3_after else '')
+
+        canno = f"c.{cds_start+1}del"
+        # Single nt deletion is always frameshift
+        exonic_func = 'frameshift deletion'
+        panno = f"p.{wtaa}{varpos}fs"
+        return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
+
+    def _annotate_deletion(self, tx, mrna_seq, exon_pos, refvarstart, refvarend,
+                           refcdsstart, cds_start, cds_end, fs, wtnt3, wtaa, varpos):
+        """Annotate a multi-nucleotide deletion."""
+        del_len = refvarend - refvarstart + 1
+        canno = f"c.{cds_start+1}_{cds_end+1}del"
+
+        if del_len % 3 == 0:
+            exonic_func = 'nonframeshift deletion'
+            if fs > 0:
+                adj_varpos = (cds_start - fs + 3) // 3 + 1
+            else:
+                adj_varpos = varpos
+            varposend = cds_end // 3 + 1
+            start_aa = self._get_aa_at(mrna_seq, refcdsstart, (adj_varpos - 1) * 3)
+            end_aa = self._get_aa_at(mrna_seq, refcdsstart, (varposend - 1) * 3)
+            panno = f"p.{start_aa}{adj_varpos}_{end_aa}{varposend}del"
+        else:
+            exonic_func = 'frameshift deletion'
+            panno = f"p.{wtaa}{varpos}fs"
+
+        return (exonic_func, f"{tx.name2}:{tx.name}:exon{exon_pos}:{canno}:{panno}")
 
     def _get_aa_at(self, mrna_seq: str, refcdsstart: int, cds_pos: int) -> str:
         """Get amino acid at a given 0-based CDS position."""

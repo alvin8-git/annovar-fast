@@ -194,53 +194,65 @@ class TabixDatabase:
         return na
 
     def _query_snp(self, chrom: str, start: int, end: int, ref: str, alt: str) -> Dict[str, str]:
-        """Query snp141 database (UCSC snp format).
+        """Query snp141 database (UCSC snp format) using ANNOVAR's exact matching logic.
 
-        Format: bin, chr, start(0-based), end, name(rsID), score, strand, refNCBI, refUCSC, observed, ...
-        ANNOVAR treats this as region-like with positionCols=(1,2,3) and colsToOutput=(4).
-        But the operation is 'f' (filter) so it needs exact variant matching.
-
-        Actually, looking at the ANNOVAR source, snp141 with operation 'f' is handled by
-        the filter_dbtype function using the region annotation framework with:
-          positionCols=(1,2,3), scoreCols=(), colsToOutput=(4)
-        It's treated as a region database in filter mode, meaning it just checks overlap.
-        The output is the rsID (Name column at index 4).
+        Format: bin, chr, start(0-based), end, name(rsID), score, strand, refNCBI, refUCSC, observed, class, ...
+        ANNOVAR matches using class-specific allele encoding and exact (chr, start+1, obs) matching.
+        Only processes records with class: single, deletion, in-del, insertion.
         """
         na = {col: NA_STRING for col in self.columns}
         records = self._fetch(chrom, start, end)
         if not records:
             return na
 
-        # For snp141 with filter operation, ANNOVAR simply checks positional overlap
-        # and returns the Name (rsID) column.
-        # The position adjustment: start is 0-based in UCSC, so add 1.
-        # But ANNOVAR's rule: $start == $end or $start++ means:
-        #   if start != end (which is always true for UCSC 0-based half-open), add 1 to start
-        best_name = None
+        # Encode query obs
+        query_obs = _encode_obs_for_query(start, end, ref, alt)
+
         for record in records:
             fields = record.split('\t')
-            if len(fields) < 5:
+            if len(fields) < 12:
                 continue
 
             try:
-                db_start = int(fields[2])
-                db_end = int(fields[3])
+                db_start = int(fields[2])  # 0-based
             except ValueError:
                 continue
 
-            # ANNOVAR logic: $start == $end or $start++
-            if db_start != db_end:
-                db_start += 1
+            rsid = fields[4]
+            ucscallele = fields[8]  # refUCSC
+            twoallele = fields[9]   # observed alleles
+            snp_class = fields[11]  # class field
 
-            # Check overlap
-            if start <= db_end and end >= db_start:
-                name = fields[4]
-                if best_name is None:
-                    best_name = name
-                # First match wins for snp141
+            # Only process recognized classes
+            if snp_class not in ('single', 'deletion', 'in-del', 'insertion'):
+                continue
 
-        if best_name:
-            return {self.columns[0]: best_name}
+            alleles = twoallele.split('/')
+            db_start_1based = db_start + 1
+
+            if snp_class == 'single':
+                # Find non-reference alleles
+                for i, allele in enumerate(alleles):
+                    if ucscallele == allele:
+                        for j, obs_allele in enumerate(alleles):
+                            if j != i and db_start_1based == start and obs_allele == query_obs:
+                                return {self.columns[0]: rsid}
+            elif snp_class == 'insertion':
+                ins_start = db_start_1based - 1  # ANNOVAR: $start--
+                if len(alleles) > 1:
+                    db_obs = '0' + alleles[1]
+                    if ins_start == start and db_obs == query_obs:
+                        return {self.columns[0]: rsid}
+            elif snp_class == 'deletion':
+                db_obs = str(len(ucscallele))
+                if db_start_1based == start and db_obs == query_obs:
+                    return {self.columns[0]: rsid}
+            elif snp_class == 'in-del':
+                if len(alleles) > 1:
+                    db_obs = str(len(ucscallele)) + alleles[1]
+                    if db_start_1based == start and db_obs == query_obs:
+                        return {self.columns[0]: rsid}
+
         return na
 
     # -------------------------------------------------------

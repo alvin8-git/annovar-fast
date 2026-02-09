@@ -53,8 +53,17 @@ class AnnotationEngine:
         start_time = time.time()
         vcf_processor = VCFProcessor(vcf_path)
 
+        # Build header: annotation columns + dynamic Otherinfo columns
+        # Otherinfo1 = zygosity, Otherinfo2-10 = VCF fixed fields (CHROM..FORMAT),
+        # Otherinfo11+ = one per sample
+        num_samples = vcf_processor.num_samples
+        num_otherinfo = 1 + 9 + num_samples  # zygosity + 9 VCF fixed fields + samples
+        annotation_cols = [c for c in OUTPUT_COLUMNS if not c.startswith('Otherinfo')]
+        otherinfo_cols = [f'Otherinfo{i}' for i in range(1, num_otherinfo + 1)]
+        header = annotation_cols + otherinfo_cols
+
         with open(output_path, 'w') as outfile:
-            outfile.write('\t'.join(OUTPUT_COLUMNS) + '\n')
+            outfile.write('\t'.join(header) + '\n')
             variant_count = 0
             for variant in vcf_processor.get_variants():
                 line = self._annotate_and_format(variant)
