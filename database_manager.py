@@ -11,7 +11,7 @@ from typing import Dict, List, Optional, Any
 
 import pysam
 
-from config import DATABASE_CONFIG, HUMANDB_TBI_DIR, NA_STRING
+from config import DATABASE_CONFIG, HUMANDB_DIR, NA_STRING
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,7 @@ class TabixDatabase:
     def __init__(self, name: str, config: Dict[str, Any]):
         self.name = name
         self.config = config
-        self.file_path = os.path.join(HUMANDB_TBI_DIR, config['file'])
+        self.file_path = os.path.join(HUMANDB_DIR, config['file'])
         self.db_type = config['type']
         self.operation = config['operation']
         self.columns = config['columns']
@@ -292,8 +292,9 @@ class TabixDatabase:
         is_phastcons = self.name.startswith('phastConsElements')
         is_cytoband = (self.name == 'cytoBand')
 
-        found_names = []
+        found_entries = []  # (region_size, name, score, normscore)
         best_score = 0
+        best_normscore = 0
         best_name = None
 
         for record in records:
@@ -347,14 +348,17 @@ class TabixDatabase:
                 # e.g., "chr9:p24.1" -> strip chr -> "9p24.1"
                 name = name.replace('chr', '')
 
-            found_names.append(name)
+            found_entries.append((name, score, normscore))
 
+        found_names = [e[0] for e in found_entries]
+
+        # Find best score across all entries
+        for name, score, normscore in found_entries:
             if score_cols:
                 if score > best_score:
                     best_score = score
+                    best_normscore = normscore
                     best_name = name
-                elif score == best_score and best_name and name != best_name:
-                    pass  # Keep existing best_name
 
         if not found_names:
             return na
@@ -370,8 +374,6 @@ class TabixDatabase:
                 result_name = unique_names[0]
         elif score_cols and not is_phastcons and len(score_cols) >= 2:
             # Databases with 2 score columns (score + normscore): format as Score=X;Name=Y
-            # ANNOVAR stores normscore in regiondb; with only 1 scoreCols, normscore is undef
-            # so Score= only appears when there are 2 score columns
             unique_names = list(dict.fromkeys(found_names))
             result_name = ','.join(unique_names)
             parts = []
@@ -381,14 +383,12 @@ class TabixDatabase:
                 parts.append(f"Name={result_name}")
             result_name = ';'.join(parts)
         elif is_phastcons:
-            # phastCons: Score=normscore;Name=lod=score
-            unique_names = list(dict.fromkeys(found_names))
-            result_name = ','.join(unique_names)
+            # phastCons: Score=normscore;Name=lod=score (best scoring region only)
             parts = []
             if best_score:
-                parts.append(f"Score={int(normscore)}")
-            if result_name:
-                parts.append(f"Name={result_name}")
+                parts.append(f"Score={int(best_normscore)}")
+            if best_name:
+                parts.append(f"Name={best_name}")
             result_name = ';'.join(parts)
         else:
             # Databases without scores: just Name=...

@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 
 import pysam
 
-from config import HUMANDB_TBI_DIR, HUMANDB_DIR, NA_STRING, DATABASE_CONFIG
+from config import HUMANDB_DIR, NA_STRING, DATABASE_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +102,7 @@ class GeneAnnotator:
         self.mrna_seqs = {}
 
         # Open tabix file
-        gene_file = os.path.join(HUMANDB_TBI_DIR, config['file'])
+        gene_file = os.path.join(HUMANDB_DIR, config['file'])
         self.tabix = None
         if os.path.exists(gene_file) and os.path.exists(gene_file + '.tbi'):
             self.tabix = pysam.TabixFile(gene_file)
@@ -195,6 +195,12 @@ class GeneAnnotator:
                 ef, ac = self._compute_exonic_annotation(tx, start, end, ref, alt)
                 if ef != '.' and ac != '.':
                     exonic_buckets.setdefault(ef, []).append(ac)
+                # ANNOVAR also checks if an exonic variant is near a splice site
+                # of another exon in the same transcript (exonicsplicing)
+                splice_detail = self._check_exonic_splicing(tx, start, end, ref, alt)
+                if splice_detail:
+                    splicing_found = True
+                    gene_detail_parts.append(splice_detail)
             elif func == 'splicing':
                 splicing_found = True
                 gene_names.add(tx.name2)
@@ -215,9 +221,12 @@ class GeneAnnotator:
                 if best_func is None:
                     best_func = func
             elif func == 'downstream':
-                downstream_genes[tx.name2] = detail
+                # Keep the minimum distance across transcripts of the same gene
+                if tx.name2 not in downstream_genes or self._parse_dist(detail) < self._parse_dist(downstream_genes[tx.name2]):
+                    downstream_genes[tx.name2] = detail
             elif func == 'upstream':
-                upstream_genes[tx.name2] = detail
+                if tx.name2 not in upstream_genes or self._parse_dist(detail) < self._parse_dist(upstream_genes[tx.name2]):
+                    upstream_genes[tx.name2] = detail
 
         # Determine final function based on priority
         # ANNOVAR: genic annotations suppress upstream/downstream
@@ -437,9 +446,67 @@ class GeneAnnotator:
 
         return ('intergenic', '')
 
+    def _check_exonic_splicing(self, tx, start: int, end: int, ref: str, alt: str) -> str:
+        """Check if an exonic variant is also near a splice site of another exon.
+
+        ANNOVAR iterates exons in order (low-to-high for + strand, high-to-low for
+        - strand) and breaks when it finds the exonic match. So splicing is only
+        checked for exons visited BEFORE the variant's exon in that order:
+        - For + strand: only exons with k < variant_exon
+        - For - strand: only exons with k > variant_exon
+        """
+        # Find which exon the variant is in
+        variant_exon = -1
+        for k in range(tx.exoncount):
+            if start >= tx.exonstarts[k] and end <= tx.exonends[k]:
+                variant_exon = k
+                break
+            if start <= tx.exonends[k] and end >= tx.exonstarts[k]:
+                variant_exon = k
+                break
+
+        if variant_exon < 0:
+            return ''
+
+        # Only check exons that ANNOVAR would visit before the variant's exon
+        if tx.strand == '+':
+            exon_range = range(0, variant_exon)
+        else:
+            exon_range = range(tx.exoncount - 1, variant_exon, -1)
+
+        for k in exon_range:
+            exon_start = tx.exonstarts[k]
+            exon_end = tx.exonends[k]
+
+            # Check acceptor site (before exon start)
+            if k > 0 or tx.exoncount == 1:
+                if self._has_overlap(start, end, exon_start - self.splicing_threshold, exon_start - 1):
+                    detail = self._make_splicing_annotation(tx, k, start, end, ref, alt)
+                    if detail:
+                        return detail
+
+            # Check donor site (after exon end)
+            if k < tx.exoncount - 1 or tx.exoncount == 1:
+                if self._has_overlap(start, end, exon_end + 1, exon_end + self.splicing_threshold):
+                    detail = self._make_splicing_annotation(tx, k, start, end, ref, alt)
+                    if detail:
+                        return detail
+
+        return ''
+
     def _has_overlap(self, start1, end1, start2, end2):
         """Check if two ranges overlap."""
         return start1 <= end2 and end1 >= start2
+
+    @staticmethod
+    def _parse_dist(detail: str) -> int:
+        """Extract numeric distance from 'dist=NNN' string."""
+        if detail and detail.startswith('dist='):
+            try:
+                return int(detail[5:])
+            except ValueError:
+                pass
+        return float('inf')
 
     def _make_utr_annotation(self, tx: Transcript, start: int, ref: str, alt: str, utr_type: str) -> str:
         """Generate UTR annotation like NM_000506:c.*97G>A (UTR3) or NM_005514:c.-18G>A (UTR5).

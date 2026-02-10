@@ -5,9 +5,8 @@ Configuration file for ANNOVAR-fast database mappings and settings
 
 import os
 
-# Database paths
-HUMANDB_TBI_DIR = "/data/alvin/annovar/humandb-tbi"
-HUMANDB_DIR = "/data/alvin/Databases/humandb"
+# Database path — all databases (tabix .txt.gz, mRNA .fa) live here
+HUMANDB_DIR = "/data/alvin/annovar/humandb-tbi"
 
 # Database mapping from annovar-hg38.awk protocol line
 # Operation types: 'g' = gene, 'r' = region, 'f' = filter
