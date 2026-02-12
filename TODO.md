@@ -1,90 +1,68 @@
-# ANNOVAR-fast TODO - Remaining Diffs from Merge.vcf Test
+# TODO
 
-## Test Command
+## Pending
+
+### Database archive
+- [ ] Upload `humandb-tbi-required.tar.gz` (29 GB) to file hosting
+  - Archive location: `/data/alvin/annovar/humandb-tbi-required.tar.gz`
+  - Contains all 39 databases (`.txt.gz` + `.tbi` pairs) + 2 mRNA FASTA files
+  - Once hosted, update `README.md` — replace `<DOWNLOAD_URL>` placeholder in the Database Setup section
+
+### Remaining annotation diffs (16 substantive, 310 order-only)
+
+Tested against ANNOVAR output on Merge.vcf (192 variants, 95 samples):
+
+| Category | Count | Details |
+|----------|-------|---------|
+| Database version (ensGene) | 12 | Gene.ensGene (11) + GeneDetail.ensGene (1) — different transcript set in hg38_ensGene_new vs original |
+| HLA-B mRNA polymorphism | 3 | AAChange.refGene — unfixable, mRNA differs at HLA locus |
+| snp141 tie-breaking | 1 | Both rsIDs valid, different strand entry chosen |
+| Order-only (cosmetic) | 310 | Region DBs return same values in different order (dgvMerged 131, encRegTfbsClustered 129, cosmic 35, gwasCatalog 13, Gene.refGene 2) |
+
+None of these are algorithmic bugs. The ensGene diffs would disappear with the same DB version; the rest are inherent to different tools querying the same data.
+
+### Potential improvements
+- [ ] Add `--sequential` CLI flag to `annovar-fast.py` (currently only available via Python API)
+- [ ] Add `--workers N` CLI flag to override `MAX_WORKERS`
+- [ ] Add `--db` CLI flag to override `HUMANDB_DIR` without editing `config.py`
+- [ ] Stream output during parallel processing instead of buffering all results in memory (reduces peak RAM for WGS)
+- [ ] Add progress logging (e.g., variants/sec, ETA) for long-running WGS jobs
+
+## Completed
+
+### Parallel annotation (2025-02-12)
+- [x] Fork-based parallelism with equal-size chunking across all CPU cores
+- [x] Workers inherit mRNA data via copy-on-write, re-open tabix handles
+- [x] WES 75K variants: 23s on 64 cores (was ~10 min in ANNOVAR)
+- [x] WGS 4.7M variants: 14 min on 64 cores (was 160 min in ANNOVAR)
+- [x] Output identical to sequential mode (verified on WES + multi-sample)
+
+### Database updates (2025-02-12)
+- [x] gnomAD v2.1.1/v3.0 -> gnomAD v4.1 (exome + genome) with prefixed column names
+- [x] ClinVar 20220730 -> 20250721
+- [x] InterVar 20180118 -> 20250721
+- [x] ljb26_all column names updated (RadialSVM->MetaSVM, LR->MetaLR, VEST3->VEST4, phyloP46way->phyloP30way)
+- [x] ensGene -> ensGene_new
+
+### Core annotation engine
+- [x] VCF parsing via cyvcf2 with gzip support
+- [x] ANNOVAR coordinate conversion (SNP, insertion, deletion, block substitution)
+- [x] Gene annotation: exonic, intronic, splicing, UTR, upstream/downstream, intergenic, ncRNA
+- [x] Amino acid change computation using mRNA FASTA
+- [x] 37 filter/region database queries via tabix
+- [x] Multi-sample VCF support
+
+## Reference files
+- ANNOVAR source: `/data/alvin/annovar/Software/annovar/annotate_variation.pl`
+- Test VCFs: `/data/alvin/annovar/vcf-hg38/` (iSeq, T7_WES, Merge, NA12878_WGS)
+- Database directory: `/data/alvin/annovar/humandb-tbi/`
+
+## Debugging
 ```bash
-cd /data/alvin/annovar/annovar-fast
+# Run annotation and compare against ANNOVAR reference
 python3 annovar-fast.py /data/alvin/annovar/vcf-hg38/Merge.vcf -o /tmp/merge_test.txt
-```
 
-## Current Status (16 substantive diffs, 310 order-only)
-**Progress: 188 → 34 → 16 substantive diffs**
-
-The iSeq single-sample test passes perfectly.
-The Merge.vcf multi-sample test (192 variants, 95 samples) has remaining issues:
-
-### Substantive Diffs
-| Column | Diffs | Notes |
-|--------|-------|-------|
-| Gene.ensGene | 11 | Database version mismatch (extra CTD-2540B15.7/MIR6891 genes) |
-| AAChange.refGene | 3 | All HLA-B mRNA polymorphism (unfixable) |
-| GeneDetail.ensGene | 1 | Database version (different exon structure for ENST00000610292.4) |
-| snp141 | 1 | rs147324178 vs rs41563412 at chr6:31356965 (tie-breaking) |
-
-### Order-only Diffs (not bugs, just different ordering of equivalent values)
-| Column | Diffs |
-|--------|-------|
-| dgvMerged | 131 |
-| encRegTfbsClustered | 129 |
-| cosmic | 35 |
-| gwasCatalog | 13 |
-| Gene.refGene | 2 |
-
-### Categorization of remaining 16 substantive diffs
-- **Database version diffs (12)**: Gene.ensGene (11) + GeneDetail.ensGene (1) — would be fixed by
-  using the same ensGene database version as the expected output
-- **HLA-B polymorphism (3)**: AAChange.refGene — unfixable, different mRNA sequence at HLA locus
-- **snp141 tie-breaking (1)**: Both rsIDs are valid at the same position, just different strand entries
-
-### Order-only diffs (310)
-Region databases return overlapping regions in different order than ANNOVAR's internal
-bin-based traversal. ANNOVAR uses UCSC binning which visits smaller/more-specific regions
-first, while tabix returns by start position. These are cosmetic — same values, different order.
-
-## What Was Fixed
-
-### Session 1
-1. **SNP141 strand handling** (35 diffs fixed): Reverse complement alleles when strand='-'
-2. **Exonic function priority** (MYD88 stoploss): Implemented exonic_buckets with priority system
-3. **NFS deletion position** (CEBPA p.G139del): Protein comparison approach instead of formula
-4. **Downstream/upstream classification** (7 F2 gene diffs): Added neargene=1000 check
-5. **UTR cDNA annotations** (UTR3 c.* and UTR5 c.-): Added _make_utr_annotation method
-6. **Splicing annotation ordering**: Sort by exon number
-7. **Splicing+UTR combined detail**: Append UTR3/UTR5 after cDNA splicing annotations
-8. **ncRNA_exonic;splicing classification**: Cross-transcript combined annotation
-
-### Session 2
-9. **ensGene database restored**: Switched back to original hg38_ensGene, fixing AAChange.ensGene (5→0)
-   and GeneDetail.ensGene (11→8→1)
-10. **Upstream/downstream minimum distance**: When multiple transcripts of the same gene are
-    near the variant, report the minimum distance (fixed 7 chr11 dist= diffs)
-11. **Exonic;splicing same-transcript detection**: Added `_check_exonic_splicing` method that
-    checks if an exonic variant is also near a splice site of an adjacent exon, using
-    ANNOVAR's strand-aware loop order (+ strand: check lower-k exons; - strand: check higher-k exons).
-    Fixed HLA-B chr6:31355219 without false positive on TP53 chr17:7675070.
-12. **phastConsElements100way**: Fixed two bugs — tracked best_normscore alongside best_score,
-    and report only the best-scoring region instead of all overlapping regions.
-
-## Reference Files
-- **ANNOVAR source**: `/data/alvin/annovar/Software/annovar/annotate_variation.pl`
-  - Exonicsplicing check (exonicsplicing flag): lines 786-807
-  - Exonicsplicing check (no flag, intronic only): lines 819-837
-  - Minus strand exon loop: lines 1002-1174
-  - Insertion logic: lines 1618-1700
-  - Deletion logic: lines 1701-1905
-  - Block substitution: lines 1731-1754, 1952-1967
-  - SNV logic: lines 1755-1800
-  - SNP141 matching: lines 2426-2500
-  - Exonic function priority: lines 2018-2116
-  - mRNA loading with multimap: lines 3321-3399, key line 3496
-- **Test input**: `/data/alvin/annovar/vcf-hg38/Merge.vcf`
-- **Expected output**: `/data/alvin/annovar/vcf-hg38/Merge.annovar.txt`
-- **mRNA files**: `/data/alvin/Databases/humandb/hg38_refGeneMrna.fa`, `hg38_ensGeneMrna.fa`
-  - Both refGene and ensGene mRNA files are used for computing AA changes (protein annotations)
-  - Splice site classification uses only exon boundaries from the gene model, not mRNA sequences
-
-## Debugging Tips
-```bash
-# Full diff count with order detection
+# Detailed diff analysis with order detection
 python3 << 'PYEOF'
 import re
 ref_lines = open('/data/alvin/annovar/vcf-hg38/Merge.annovar.txt').readlines()
