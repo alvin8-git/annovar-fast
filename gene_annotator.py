@@ -255,7 +255,7 @@ class GeneAnnotator:
         else:
             final_func = 'intergenic'
 
-        gene_name = ','.join(sorted(gene_names)) if gene_names else '.'
+        gene_name = ';'.join(sorted(gene_names)) if gene_names else '.'
 
         # UTR details only appear in GeneDetail when final func is UTR (not when exonic/splicing)
         if final_func in ('UTR5', 'UTR3'):
@@ -1308,6 +1308,15 @@ class GeneAnnotator:
             f'ExonicFunc.{suffix}': exonic_func,
             f'AAChange.{suffix}': aa_change,
         }
+
+    def reopen_tabix(self):
+        """Re-open tabix file handle (required after fork to avoid sharing file descriptors)."""
+        config = DATABASE_CONFIG[self.db_name]
+        gene_file = os.path.join(HUMANDB_DIR, config['file'])
+        if self.tabix:
+            self.tabix.close()
+        if os.path.exists(gene_file) and os.path.exists(gene_file + '.tbi'):
+            self.tabix = pysam.TabixFile(gene_file)
 
     def close(self):
         if self.tabix:

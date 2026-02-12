@@ -79,6 +79,17 @@ class TabixDatabase:
     def is_available(self) -> bool:
         return self.tabix is not None
 
+    def reopen_tabix(self):
+        """Re-open tabix file handle (required after fork to avoid sharing file descriptors)."""
+        if self.tabix:
+            self.tabix.close()
+        if os.path.exists(self.file_path) and os.path.exists(self.file_path + '.tbi'):
+            try:
+                self.tabix = pysam.TabixFile(self.file_path)
+                self._contigs = set(self.tabix.contigs)
+            except Exception as e:
+                logger.warning(f"Failed to reopen {self.name}: {e}")
+
     def close(self):
         if self.tabix:
             self.tabix.close()
@@ -436,6 +447,11 @@ class DatabaseManager:
             return db.query_region(chrom, start, end, ref, alt)
         else:
             return {col: NA_STRING for col in db.columns}
+
+    def reopen_all_tabix(self):
+        """Re-open all tabix file handles (required after fork)."""
+        for db in self.databases.values():
+            db.reopen_tabix()
 
     def close(self):
         for db in self.databases.values():

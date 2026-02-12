@@ -7,7 +7,8 @@ Converts VCF variants to ANNOVAR format matching convert2annovar.pl --format vcf
 import os
 import sys
 import logging
-from typing import List, Dict, Any, Iterator
+from collections import defaultdict
+from typing import List, Dict, Any, Iterator, Tuple
 
 try:
     import cyvcf2
@@ -53,7 +54,9 @@ class VCFProcessor:
         self.num_samples = len(self.sample_names)
 
         # Read raw data lines (non-header) for exact field preservation
-        with open(self.vcf_path) as f:
+        import gzip
+        opener = gzip.open if self.vcf_path.endswith('.gz') else open
+        with opener(self.vcf_path, 'rt') as f:
             for line in f:
                 if not line.startswith('#'):
                     self._raw_lines.append(line.rstrip('\n\r'))
@@ -72,10 +75,11 @@ class VCFProcessor:
 
             raw_line = self._raw_lines[line_idx] if line_idx < len(self._raw_lines) else None
 
-            for alt in alts:
-                if alt == '<M>' or alt == '*':
-                    continue
-                yield self._convert_to_annovar_format(variant, alt, raw_line)
+            # Only process first ALT allele (matches convert2annovar.pl --format vcf4old)
+            alt = alts[0]
+            if alt == '<M>' or alt == '*':
+                continue
+            yield self._convert_to_annovar_format(variant, alt, raw_line)
 
     def _convert_to_annovar_format(self, cyvcf_variant, alt: str, raw_line: str) -> Variant:
         """Convert cyvcf2 variant to ANNOVAR format.
@@ -174,6 +178,19 @@ class VCFProcessor:
                 return 'hom'  # 0/0 shouldn't happen for called variants
         except Exception:
             return 'unknown'
+
+    def get_variants_by_chrom(self) -> Tuple[Dict[str, List[Tuple[int, 'Variant']]], int]:
+        """Group all variants by chromosome, preserving original order.
+
+        Returns:
+            (chrom_dict, total_count) where chrom_dict maps chrom -> list of (original_index, Variant)
+        """
+        by_chrom = defaultdict(list)
+        idx = 0
+        for variant in self.get_variants():
+            by_chrom[variant.chrom].append((idx, variant))
+            idx += 1
+        return dict(by_chrom), idx
 
     def _build_vcf_fields(self, raw_line: str) -> list:
         """Build VCF fields for Otherinfo columns from the raw VCF line.
