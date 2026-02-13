@@ -11,6 +11,11 @@ import logging
 import time
 from pathlib import Path
 
+import pysam
+# Suppress benign htslib warnings (e.g., "Coordinate <= 0", "index older than data")
+# Level 1 = errors only; warnings are noise from database records with 0-based coords
+pysam.set_verbosity(1)
+
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,

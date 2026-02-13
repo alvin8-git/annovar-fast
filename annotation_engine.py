@@ -54,6 +54,8 @@ def _init_worker():
     The _worker_engine global is inherited from the parent via fork (COW).
     We only need to re-open tabix file descriptors which can't be shared.
     """
+    import pysam
+    pysam.set_verbosity(1)  # suppress htslib warnings in worker
     _worker_engine.db_manager.reopen_all_tabix()
     for ga in _worker_engine.gene_annotators.values():
         ga.reopen_tabix()
